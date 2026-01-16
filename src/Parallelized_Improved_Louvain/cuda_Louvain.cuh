@@ -255,7 +255,7 @@ __global__ void detect_trees_kernel(
 }
 
 class CUDALouvain {
-private:
+public:
     DeviceGraph d_graph_;
     thrust::device_vector<Community> d_node_to_comm_;
     thrust::device_vector<Weight> d_comm_degrees_;

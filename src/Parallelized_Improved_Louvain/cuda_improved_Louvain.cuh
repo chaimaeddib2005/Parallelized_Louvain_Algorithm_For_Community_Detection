@@ -308,7 +308,7 @@ __global__ void compute_modularity_kernel(
 }
 
 class CUDAImprovedLouvain {
-private:
+public:
     DeviceGraph d_graph_;
     thrust::device_vector<Community> d_node_to_comm_;
     thrust::device_vector<Weight> d_comm_degrees_;
