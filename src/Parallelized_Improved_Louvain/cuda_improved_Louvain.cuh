@@ -53,7 +53,22 @@ struct DeviceGraph {
     Weight total_weight;
 };
 
-// Kernel: BFS for tree detection (simplified version)
+// Kernel: Initialize visited array for BFS
+__global__ void init_bfs_kernel(
+    NodeID start_node,
+    int* visited,
+    int* current_frontier,
+    int* component_id,
+    int comp_id
+) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        visited[start_node] = 1;
+        current_frontier[start_node] = 1;
+        component_id[start_node] = comp_id;
+    }
+}
+
+// Kernel: BFS for tree detection (improved version)
 __global__ void bfs_step_kernel(
     const EdgeID* __restrict__ row_ptr,
     const NodeID* __restrict__ col_idx,
@@ -66,7 +81,7 @@ __global__ void bfs_step_kernel(
     int comp_id
 ) {
     NodeID node = blockIdx.x * blockDim.x + threadIdx.x;
-    if (node >= num_nodes || !current_frontier[node]) return;
+    if (node >= num_nodes || current_frontier[node] == 0) return;
     
     EdgeID start = row_ptr[node];
     EdgeID end = row_ptr[node + 1];
@@ -75,25 +90,30 @@ __global__ void bfs_step_kernel(
         NodeID neighbor = col_idx[e];
         
         // Try to visit neighbor with properly aligned atomic operation
-        if (atomicCAS(&visited[neighbor], 0, 1) == 0) {
+        int old = atomicCAS(&visited[neighbor], 0, 1);
+        if (old == 0) {
             next_frontier[neighbor] = 1;
             parent[neighbor] = node;
-            component_id[neighbor] = comp_id;
+            atomicExch(&component_id[neighbor], comp_id);
         }
     }
 }
 
-// Kernel: Count edges in component for tree detection
+// Kernel: Count edges in component for tree detection (improved)
 __global__ void count_component_edges_kernel(
     const EdgeID* __restrict__ row_ptr,
     const NodeID* __restrict__ col_idx,
     const int* __restrict__ component_id,
     NodeID num_nodes,
     int comp_id,
-    unsigned long long* edge_count
+    unsigned long long* edge_count,
+    unsigned long long* node_count
 ) {
     NodeID node = blockIdx.x * blockDim.x + threadIdx.x;
     if (node >= num_nodes || component_id[node] != comp_id) return;
+    
+    // Count this node
+    atomicAdd(node_count, 1ULL);
     
     EdgeID start = row_ptr[node];
     EdgeID end = row_ptr[node + 1];
@@ -407,7 +427,7 @@ public:
         return result;
     }
     
-public:
+    // Public helper functions (needed for device lambdas)
     void upload_graph_to_device(const Graph& graph) {
         d_graph_.num_nodes = graph.num_nodes();
         d_graph_.num_edges = graph.num_edges();
@@ -532,15 +552,7 @@ public:
             // Check if it's a tree: |E| = |V| - 1 and size > 2
             if (component_size > 2 && edge_count == component_size - 1) {
                 // Mark all nodes in this component as tree nodes
-                thrust::transform(
-                    thrust::make_counting_iterator<NodeID>(0),
-                    thrust::make_counting_iterator<NodeID>(num_nodes),
-                    d_component_id.begin(),
-                    d_is_tree_node_.begin(),
-                    [comp_id] __device__ (NodeID node, int cid) {
-                        return cid == comp_id;
-                    }
-                );
+                mark_tree_component(d_component_id, comp_id, num_nodes);
             }
             
             comp_id++;
@@ -651,18 +663,34 @@ public:
             CUDA_CHECK(cudaDeviceSynchronize());
             
             // Exclude tree nodes from active set
-            thrust::transform(
-                d_active_.begin(),
-                d_active_.end(),
-                d_is_tree_node_.begin(),
-                d_active_.begin(),
-                [] __device__ (bool active, bool is_tree) {
-                    return active && !is_tree;
-                }
-            );
+            exclude_tree_nodes_from_active();
         }
         
         return global_improvement;
+    }
+    
+    void mark_tree_component(thrust::device_vector<int>& d_component_id, int comp_id, NodeID num_nodes) {
+        thrust::transform(
+            thrust::make_counting_iterator<NodeID>(0),
+            thrust::make_counting_iterator<NodeID>(num_nodes),
+            d_component_id.begin(),
+            d_is_tree_node_.begin(),
+            [comp_id] __device__ (NodeID node, int cid) {
+                return cid == comp_id;
+            }
+        );
+    }
+    
+    void exclude_tree_nodes_from_active() {
+        thrust::transform(
+            d_active_.begin(),
+            d_active_.end(),
+            d_is_tree_node_.begin(),
+            d_active_.begin(),
+            [] __device__ (bool active, bool is_tree) {
+                return active && !is_tree;
+            }
+        );
     }
     
     double compute_modularity() {
