@@ -96,9 +96,9 @@ int main() {
     printf("Running Parallelized Louvain Algorithm\n");
     printf("========================================\n\n");
     cuda_louvain::CUDALouvain cuda_louvain(graph);
-    auto result = cuda_louvain.detect_communities();
+    auto result2 = cuda_louvain.detect_communities();
     
     printf("Found %u communities with modularity %.6f\n",
-           result.num_communities, result.modularity);
+           result2.num_communities, result2.modularity);
     return 0;
 }
