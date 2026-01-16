@@ -410,7 +410,7 @@ public:
         return result;
     }
     
-private:
+public:
     void upload_graph_to_device(const Graph& graph) {
         d_graph_.num_nodes = graph.num_nodes();
         d_graph_.num_edges = graph.num_edges();
