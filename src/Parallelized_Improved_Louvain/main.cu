@@ -103,7 +103,7 @@ int main() {
     printf("\n========================================\n");
     printf("Running Cuda improved Louvain algorithm\n");
     printf("\n========================================\n\n");
-    CUDAImprovedLouvain::CUDAImprovedLouvain cuda_improved_louvain(graph);
+    cuda_improved_louvain::CUDAImprovedLouvain cuda_improved_louvain(graph);
     auto result3 = cuda_improved_louvain.detect_communities();
     printf("Found %u communities with modularity %.6f\n",
            result3.num_communities, result3.modularity);
