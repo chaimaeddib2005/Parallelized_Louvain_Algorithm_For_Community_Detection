@@ -464,10 +464,10 @@ public:
         d_is_tree_node_.resize(num_nodes, false);
         
         thrust::device_vector<int> d_component_id(num_nodes, -1);
-        thrust::device_vector<uint8_t> d_visited(num_nodes, 0);
+        thrust::device_vector<bool> d_visited(num_nodes, false);
         thrust::device_vector<NodeID> d_parent(num_nodes, num_nodes);
-        thrust::device_vector<uint8_t> d_current_frontier(num_nodes, 0);
-        thrust::device_vector<uint8_t> d_next_frontier(num_nodes, 0);
+        thrust::device_vector<bool> d_current_frontier(num_nodes, false);
+        thrust::device_vector<bool> d_next_frontier(num_nodes, false);
         
         int comp_id = 0;
         
@@ -482,8 +482,8 @@ public:
             // Initialize BFS from this node
             thrust::fill(d_current_frontier.begin(), d_current_frontier.end(), false);
             thrust::fill(d_next_frontier.begin(), d_next_frontier.end(), false);
-            d_current_frontier[start] = 1;
-            d_visited[start] = 1;
+            d_current_frontier[start] = true;
+            d_visited[start] = true;
             d_component_id[start] = comp_id;
             
             uint32_t component_size = 1;
