@@ -58,9 +58,9 @@ __global__ void bfs_step_kernel(
     const EdgeID* __restrict__ row_ptr,
     const NodeID* __restrict__ col_idx,
     NodeID num_nodes,
-    const bool* __restrict__ current_frontier,
-    bool* next_frontier,
-    bool* visited,
+    const int* __restrict__ current_frontier,
+    int* next_frontier,
+    int* visited,
     NodeID* parent,
     int* component_id,
     int comp_id
@@ -74,14 +74,11 @@ __global__ void bfs_step_kernel(
     for (EdgeID e = start; e < end; ++e) {
         NodeID neighbor = col_idx[e];
         
-        // Try to visit neighbor
-        if (!visited[neighbor]) {
-            bool expected = false;
-            if (atomicCAS((int*)&visited[neighbor], 0, 1) == 0) {
-                next_frontier[neighbor] = true;
-                parent[neighbor] = node;
-                component_id[neighbor] = comp_id;
-            }
+        // Try to visit neighbor with properly aligned atomic operation
+        if (atomicCAS(&visited[neighbor], 0, 1) == 0) {
+            next_frontier[neighbor] = 1;
+            parent[neighbor] = node;
+            component_id[neighbor] = comp_id;
         }
     }
 }
@@ -93,7 +90,7 @@ __global__ void count_component_edges_kernel(
     const int* __restrict__ component_id,
     NodeID num_nodes,
     int comp_id,
-    EdgeID* edge_count
+    unsigned long long* edge_count
 ) {
     NodeID node = blockIdx.x * blockDim.x + threadIdx.x;
     if (node >= num_nodes || component_id[node] != comp_id) return;
@@ -105,7 +102,7 @@ __global__ void count_component_edges_kernel(
         NodeID neighbor = col_idx[e];
         // Count each edge once (only if neighbor > node and in same component)
         if (component_id[neighbor] == comp_id && neighbor > node) {
-            atomicAdd((unsigned long long*)edge_count, 1ULL);
+            atomicAdd(edge_count, 1ULL);
         }
     }
 }
@@ -410,7 +407,7 @@ public:
         return result;
     }
     
-public:
+private:
     void upload_graph_to_device(const Graph& graph) {
         d_graph_.num_nodes = graph.num_nodes();
         d_graph_.num_edges = graph.num_edges();
@@ -464,26 +461,26 @@ public:
         d_is_tree_node_.resize(num_nodes, false);
         
         thrust::device_vector<int> d_component_id(num_nodes, -1);
-        thrust::device_vector<bool> d_visited(num_nodes, false);
+        thrust::device_vector<int> d_visited(num_nodes, 0);
         thrust::device_vector<NodeID> d_parent(num_nodes, num_nodes);
-        thrust::device_vector<bool> d_current_frontier(num_nodes, false);
-        thrust::device_vector<bool> d_next_frontier(num_nodes, false);
+        thrust::device_vector<int> d_current_frontier(num_nodes, 0);
+        thrust::device_vector<int> d_next_frontier(num_nodes, 0);
         
         int comp_id = 0;
         
         // Find connected components and check if they're trees
         for (NodeID start = 0; start < num_nodes; ++start) {
-            bool visited = false;
+            int visited = 0;
             cudaMemcpy(&visited, thrust::raw_pointer_cast(d_visited.data()) + start,
-                      sizeof(bool), cudaMemcpyDeviceToHost);
+                      sizeof(int), cudaMemcpyDeviceToHost);
             
             if (visited) continue;
             
             // Initialize BFS from this node
-            thrust::fill(d_current_frontier.begin(), d_current_frontier.end(), false);
-            thrust::fill(d_next_frontier.begin(), d_next_frontier.end(), false);
-            d_current_frontier[start] = true;
-            d_visited[start] = true;
+            thrust::fill(d_current_frontier.begin(), d_current_frontier.end(), 0);
+            thrust::fill(d_next_frontier.begin(), d_next_frontier.end(), 0);
+            d_current_frontier[start] = 1;
+            d_visited[start] = 1;
             d_component_id[start] = comp_id;
             
             uint32_t component_size = 1;
@@ -505,19 +502,19 @@ public:
                 CUDA_CHECK(cudaDeviceSynchronize());
                 
                 uint32_t frontier_size = thrust::reduce(d_next_frontier.begin(),
-                                                        d_next_frontier.end(), 0u);
+                                                        d_next_frontier.end(), 0);
                 component_size += frontier_size;
                 
                 if (frontier_size == 0) {
                     has_frontier = false;
                 } else {
                     d_current_frontier = d_next_frontier;
-                    thrust::fill(d_next_frontier.begin(), d_next_frontier.end(), false);
+                    thrust::fill(d_next_frontier.begin(), d_next_frontier.end(), 0);
                 }
             }
             
             // Count edges in component
-            thrust::device_vector<EdgeID> d_edge_count(1, 0);
+            thrust::device_vector<unsigned long long> d_edge_count(1, 0ULL);
             count_component_edges_kernel<<<num_blocks, block_size_>>>(
                 d_graph_.d_row_ptr,
                 d_graph_.d_col_idx,
@@ -528,9 +525,9 @@ public:
             );
             CUDA_CHECK(cudaDeviceSynchronize());
             
-            EdgeID edge_count;
+            unsigned long long edge_count;
             cudaMemcpy(&edge_count, thrust::raw_pointer_cast(d_edge_count.data()),
-                      sizeof(EdgeID), cudaMemcpyDeviceToHost);
+                      sizeof(unsigned long long), cudaMemcpyDeviceToHost);
             
             // Check if it's a tree: |E| = |V| - 1 and size > 2
             if (component_size > 2 && edge_count == component_size - 1) {
