@@ -53,7 +53,22 @@ struct DeviceGraph {
     Weight total_weight;
 };
 
-// Kernel: BFS for tree detection (simplified version)
+// Kernel: Initialize visited array for BFS
+__global__ void init_bfs_kernel(
+    NodeID start_node,
+    int* visited,
+    int* current_frontier,
+    int* component_id,
+    int comp_id
+) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        visited[start_node] = 1;
+        current_frontier[start_node] = 1;
+        component_id[start_node] = comp_id;
+    }
+}
+
+// Kernel: BFS for tree detection (improved version)
 __global__ void bfs_step_kernel(
     const EdgeID* __restrict__ row_ptr,
     const NodeID* __restrict__ col_idx,
@@ -66,7 +81,7 @@ __global__ void bfs_step_kernel(
     int comp_id
 ) {
     NodeID node = blockIdx.x * blockDim.x + threadIdx.x;
-    if (node >= num_nodes || !current_frontier[node]) return;
+    if (node >= num_nodes || current_frontier[node] == 0) return;
     
     EdgeID start = row_ptr[node];
     EdgeID end = row_ptr[node + 1];
@@ -75,25 +90,30 @@ __global__ void bfs_step_kernel(
         NodeID neighbor = col_idx[e];
         
         // Try to visit neighbor with properly aligned atomic operation
-        if (atomicCAS(&visited[neighbor], 0, 1) == 0) {
+        int old = atomicCAS(&visited[neighbor], 0, 1);
+        if (old == 0) {
             next_frontier[neighbor] = 1;
             parent[neighbor] = node;
-            component_id[neighbor] = comp_id;
+            atomicExch(&component_id[neighbor], comp_id);
         }
     }
 }
 
-// Kernel: Count edges in component for tree detection
+// Kernel: Count edges in component for tree detection (improved)
 __global__ void count_component_edges_kernel(
     const EdgeID* __restrict__ row_ptr,
     const NodeID* __restrict__ col_idx,
     const int* __restrict__ component_id,
     NodeID num_nodes,
     int comp_id,
-    unsigned long long* edge_count
+    unsigned long long* edge_count,
+    unsigned long long* node_count
 ) {
     NodeID node = blockIdx.x * blockDim.x + threadIdx.x;
     if (node >= num_nodes || component_id[node] != comp_id) return;
+    
+    // Count this node
+    atomicAdd(node_count, 1ULL);
     
     EdgeID start = row_ptr[node];
     EdgeID end = row_ptr[node + 1];
@@ -357,14 +377,17 @@ public:
         Result result;
         
         printf("Starting CUDA Improved Louvain algorithm...\n");
+        printf("Graph: %u nodes, %llu edges, total weight: %.2f\n",
+               d_graph_.num_nodes, d_graph_.num_edges, d_graph_.total_weight);
         
         uint32_t iteration = 0;
         double prev_modularity = -1.0;
+        const uint32_t MAX_ITERATIONS = 100;
         
-        while (iteration < 100) {
+        while (iteration < MAX_ITERATIONS) {
             // Count active nodes
             uint32_t num_active = thrust::reduce(d_active_.begin(), d_active_.end(), 0u);
-            printf("Iteration %u: Active nodes = %u\n", iteration, num_active);
+            printf("\nIteration %u: Active nodes = %u\n", iteration, num_active);
             
             if (num_active == 0) {
                 printf("No active nodes remaining, stopping\n");
@@ -385,14 +408,32 @@ public:
             printf("Iteration %u: Modularity = %.6f, Communities = %u\n",
                    iteration, current_modularity, num_comms);
             
-            if (iteration > 0 && current_modularity - prev_modularity < min_modularity_gain_) {
-                printf("Iteration %u: Modularity gain < threshold, stopping\n", iteration);
-                break;
+            if (iteration > 0) {
+                double mod_gain = current_modularity - prev_modularity;
+                printf("  Modularity gain: %.6e (threshold: %.6e)\n", 
+                       mod_gain, min_modularity_gain_);
+                
+                if (mod_gain < min_modularity_gain_) {
+                    printf("Iteration %u: Modularity gain < threshold, stopping\n", iteration);
+                    break;
+                }
+                
+                // Safety check: if modularity decreased, something is wrong
+                if (mod_gain < -1e-6) {
+                    printf("Warning: Modularity decreased! This shouldn't happen.\n");
+                }
             }
             
             prev_modularity = current_modularity;
             iteration++;
         }
+        
+        if (iteration >= MAX_ITERATIONS) {
+            printf("Warning: Reached maximum iterations (%u)\n", MAX_ITERATIONS);
+        }
+        
+        printf("\nFinal results:\n");
+        printf("  Total iterations: %u\n", iteration);
         
         // Download results
         thrust::host_vector<Community> h_communities = d_node_to_comm_;
@@ -404,10 +445,14 @@ public:
         result.num_iterations = iteration;
         result.tree_nodes_detected = thrust::reduce(h_tree_nodes.begin(), h_tree_nodes.end(), 0u);
         
+        printf("  Final modularity: %.6f\n", result.modularity);
+        printf("  Final communities: %u\n", result.num_communities);
+        printf("  Tree nodes: %u\n", result.tree_nodes_detected);
+        
         return result;
     }
     
-public:
+    // Public helper functions (needed for device lambdas)
     void upload_graph_to_device(const Graph& graph) {
         d_graph_.num_nodes = graph.num_nodes();
         d_graph_.num_edges = graph.num_edges();
@@ -532,15 +577,7 @@ public:
             // Check if it's a tree: |E| = |V| - 1 and size > 2
             if (component_size > 2 && edge_count == component_size - 1) {
                 // Mark all nodes in this component as tree nodes
-                thrust::transform(
-                    thrust::make_counting_iterator<NodeID>(0),
-                    thrust::make_counting_iterator<NodeID>(num_nodes),
-                    d_component_id.begin(),
-                    d_is_tree_node_.begin(),
-                    [comp_id] __device__ (NodeID node, int cid) {
-                        return cid == comp_id;
-                    }
-                );
+                mark_tree_component(d_component_id, comp_id, num_nodes);
             }
             
             comp_id++;
@@ -581,12 +618,15 @@ public:
         int num_blocks = (num_nodes + block_size_ - 1) / block_size_;
         
         bool global_improvement = false;
+        const int MAX_INNER_ITERATIONS = 100; // Prevent infinite loops
+        int inner_iteration = 0;
         
         // Dynamic iteration: continue while there are active nodes
-        while (true) {
+        while (inner_iteration < MAX_INNER_ITERATIONS) {
             uint32_t num_active = thrust::reduce(d_active_.begin(), d_active_.end(), 0u);
             
             if (num_active == 0) {
+                printf("  Inner iteration %d: No active nodes, stopping\n", inner_iteration);
                 break;
             }
             
@@ -620,6 +660,7 @@ public:
                                                  thrust::logical_or<bool>());
             
             if (!any_improvement) {
+                printf("  Inner iteration %d: No improvements, stopping\n", inner_iteration);
                 break;
             }
             
@@ -638,6 +679,15 @@ public:
             );
             CUDA_CHECK(cudaDeviceSynchronize());
             
+            // Count how many nodes actually moved
+            uint32_t num_moved = thrust::reduce(d_moved_.begin(), d_moved_.end(), 0u);
+            printf("  Inner iteration %d: %u nodes moved\n", inner_iteration, num_moved);
+            
+            if (num_moved == 0) {
+                printf("  Inner iteration %d: No nodes moved, stopping\n", inner_iteration);
+                break;
+            }
+            
             // Update active set: nodes that moved + their neighbors
             thrust::fill(d_active_.begin(), d_active_.end(), false);
             
@@ -651,18 +701,40 @@ public:
             CUDA_CHECK(cudaDeviceSynchronize());
             
             // Exclude tree nodes from active set
-            thrust::transform(
-                d_active_.begin(),
-                d_active_.end(),
-                d_is_tree_node_.begin(),
-                d_active_.begin(),
-                [] __device__ (bool active, bool is_tree) {
-                    return active && !is_tree;
-                }
-            );
+            exclude_tree_nodes_from_active();
+            
+            inner_iteration++;
+        }
+        
+        if (inner_iteration >= MAX_INNER_ITERATIONS) {
+            printf("  Warning: Reached maximum inner iterations (%d)\n", MAX_INNER_ITERATIONS);
         }
         
         return global_improvement;
+    }
+    
+    void mark_tree_component(thrust::device_vector<int>& d_component_id, int comp_id, NodeID num_nodes) {
+        thrust::transform(
+            thrust::make_counting_iterator<NodeID>(0),
+            thrust::make_counting_iterator<NodeID>(num_nodes),
+            d_component_id.begin(),
+            d_is_tree_node_.begin(),
+            [comp_id] __device__ (NodeID node, int cid) {
+                return cid == comp_id;
+            }
+        );
+    }
+    
+    void exclude_tree_nodes_from_active() {
+        thrust::transform(
+            d_active_.begin(),
+            d_active_.end(),
+            d_is_tree_node_.begin(),
+            d_active_.begin(),
+            [] __device__ (bool active, bool is_tree) {
+                return active && !is_tree;
+            }
+        );
     }
     
     double compute_modularity() {
