@@ -226,15 +226,13 @@ __global__ void compute_best_moves_active_kernel(
     }
 }
 
-// Kernel: Apply moves and mark nodes that moved
+// Kernel: Apply moves and mark nodes that moved (FIXED VERSION)
 __global__ void apply_moves_kernel(
     const Community* __restrict__ best_comm,
     const bool* __restrict__ has_improvement,
     const bool* __restrict__ is_active,
-    const Weight* __restrict__ node_degrees,
     NodeID num_nodes,
     Community* node_to_comm,
-    Weight* comm_degrees,
     bool* moved
 ) {
     NodeID node = blockIdx.x * blockDim.x + threadIdx.x;
@@ -250,16 +248,26 @@ __global__ void apply_moves_kernel(
     
     Community old_comm = node_to_comm[node];
     Community new_comm = best_comm[node];
-    Weight node_deg = node_degrees[node];
     
-    // Apply move
+    // Only apply move, don't update degrees here
     node_to_comm[node] = new_comm;
-    
-    // Update community degrees atomically
-    atomicAdd(&comm_degrees[new_comm], node_deg);
-    atomicAdd(&comm_degrees[old_comm], -node_deg);
-    
     moved[node] = true;
+}
+
+// Kernel: Recompute all community degrees from scratch
+__global__ void recompute_comm_degrees_kernel(
+    const Weight* __restrict__ node_degrees,
+    const Community* __restrict__ node_to_comm,
+    NodeID num_nodes,
+    Weight* comm_degrees
+) {
+    NodeID node = blockIdx.x * blockDim.x + threadIdx.x;
+    if (node >= num_nodes) return;
+    
+    Community comm = node_to_comm[node];
+    Weight deg = node_degrees[node];
+    
+    atomicAdd(&comm_degrees[comm], deg);
 }
 
 // Kernel: Mark nodes as active for next iteration (nodes that moved + their neighbors)
@@ -680,11 +688,19 @@ public:
                 thrust::raw_pointer_cast(d_best_comm_.data()),
                 thrust::raw_pointer_cast(d_has_improvement_.data()),
                 thrust::raw_pointer_cast(d_active_.data()),
-                d_graph_.d_node_degrees,
                 num_nodes,
                 thrust::raw_pointer_cast(d_node_to_comm_.data()),
-                thrust::raw_pointer_cast(d_comm_degrees_.data()),
                 thrust::raw_pointer_cast(d_moved_.data())
+            );
+            CUDA_CHECK(cudaDeviceSynchronize());
+            
+            // Recompute community degrees from scratch to avoid race conditions
+            thrust::fill(d_comm_degrees_.begin(), d_comm_degrees_.end(), 0.0f);
+            recompute_comm_degrees_kernel<<<num_blocks, block_size_>>>(
+                d_graph_.d_node_degrees,
+                thrust::raw_pointer_cast(d_node_to_comm_.data()),
+                num_nodes,
+                thrust::raw_pointer_cast(d_comm_degrees_.data())
             );
             CUDA_CHECK(cudaDeviceSynchronize());
             
