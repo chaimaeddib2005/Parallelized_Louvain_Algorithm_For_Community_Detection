@@ -560,22 +560,31 @@ public:
             
             // Count edges in component
             thrust::device_vector<unsigned long long> d_edge_count(1, 0ULL);
+            thrust::device_vector<unsigned long long> d_node_count(1, 0ULL);
             count_component_edges_kernel<<<num_blocks, block_size_>>>(
                 d_graph_.d_row_ptr,
                 d_graph_.d_col_idx,
                 thrust::raw_pointer_cast(d_component_id.data()),
                 num_nodes,
                 comp_id,
-                thrust::raw_pointer_cast(d_edge_count.data())
+                thrust::raw_pointer_cast(d_edge_count.data()),
+                thrust::raw_pointer_cast(d_node_count.data())
             );
             CUDA_CHECK(cudaDeviceSynchronize());
             
             unsigned long long edge_count;
-            cudaMemcpy(&edge_count, thrust::raw_pointer_cast(d_edge_count.data()),
-                      sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+            unsigned long long node_count_verify;
+            CUDA_CHECK(cudaMemcpy(&edge_count, 
+                thrust::raw_pointer_cast(d_edge_count.data()),
+                sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(&node_count_verify, 
+                thrust::raw_pointer_cast(d_node_count.data()),
+                sizeof(unsigned long long), cudaMemcpyDeviceToHost));
             
             // Check if it's a tree: |E| = |V| - 1 and size > 2
-            if (component_size > 2 && edge_count == component_size - 1) {
+            if (node_count_verify > 2 && edge_count == node_count_verify - 1) {
+                printf("Component %d: Tree detected! nodes=%llu, edges=%llu\n", 
+                       comp_id, node_count_verify, edge_count);
                 // Mark all nodes in this component as tree nodes
                 mark_tree_component(d_component_id, comp_id, num_nodes);
             }
