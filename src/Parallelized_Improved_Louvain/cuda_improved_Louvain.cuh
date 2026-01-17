@@ -9,9 +9,7 @@
 #include <thrust/sort.h>
 #include <thrust/unique.h>
 #include <thrust/reduce.h>
-#include <thrust/scan.h>
 #include <thrust/execution_policy.h>
-#include <curand_kernel.h>
 
 // CUDA error checking macro
 #define CUDA_CHECK(call) \
@@ -23,17 +21,6 @@
             exit(EXIT_FAILURE); \
         } \
     } while(0)
-
-/**
- * GPU-accelerated IMPROVED Fast Louvain Algorithm
- * Based on: Zhang et al. (2021) "An Improved Louvain Algorithm for Community Detection"
- * 
- * Key improvements implemented:
- * 1. Dynamic iteration - only processes active nodes
- * 2. Tree structure detection and splitting
- * 3. Active node tracking and propagation
- * 4. Early stopping based on modularity gain
- */
 
 namespace cuda_improved_louvain {
 
@@ -53,245 +40,156 @@ struct DeviceGraph {
     Weight total_weight;
 };
 
-// Kernel: Initialize visited array for BFS
-__global__ void init_bfs_kernel(
-    NodeID start_node,
-    int* visited,
-    int* current_frontier,
-    int* component_id,
-    int comp_id
-) {
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        visited[start_node] = 1;
-        current_frontier[start_node] = 1;
-        component_id[start_node] = comp_id;
-    }
-}
-
-// Kernel: BFS for tree detection (improved version)
-__global__ void bfs_step_kernel(
+// Kernel: Initialize community weights (sum of edge weights within community)
+__global__ void initialize_community_weights_kernel(
     const EdgeID* __restrict__ row_ptr,
     const NodeID* __restrict__ col_idx,
+    const Weight* __restrict__ weights,
+    const Community* __restrict__ node_to_comm,
     NodeID num_nodes,
-    const int* __restrict__ current_frontier,
-    int* next_frontier,
-    int* visited,
-    NodeID* parent,
-    int* component_id,
-    int comp_id
+    Weight* comm_internal_weight
 ) {
-    NodeID node = blockIdx.x * blockDim.x + threadIdx.x;
-    if (node >= num_nodes || current_frontier[node] == 0) return;
+    NodeID u = blockIdx.x * blockDim.x + threadIdx.x;
+    if (u >= num_nodes) return;
     
-    EdgeID start = row_ptr[node];
-    EdgeID end = row_ptr[node + 1];
+    Community cu = node_to_comm[u];
+    EdgeID start = row_ptr[u];
+    EdgeID end = row_ptr[u + 1];
     
     for (EdgeID e = start; e < end; ++e) {
-        NodeID neighbor = col_idx[e];
-        
-        // Try to visit neighbor with properly aligned atomic operation
-        int old = atomicCAS(&visited[neighbor], 0, 1);
-        if (old == 0) {
-            next_frontier[neighbor] = 1;
-            parent[neighbor] = node;
-            atomicExch(&component_id[neighbor], comp_id);
+        NodeID v = col_idx[e];
+        Community cv = node_to_comm[v];
+        if (cu == cv) {
+            Weight w = weights[e];
+            atomicAdd(&comm_internal_weight[cu], w / 2.0f); // Divide by 2 to avoid double counting
         }
     }
 }
 
-// Kernel: Count edges in component for tree detection (improved)
-__global__ void count_component_edges_kernel(
-    const EdgeID* __restrict__ row_ptr,
-    const NodeID* __restrict__ col_idx,
-    const int* __restrict__ component_id,
+// Kernel: Compute community degrees (total degree of all nodes in community)
+__global__ void compute_community_degrees_kernel(
+    const Weight* __restrict__ node_degrees,
+    const Community* __restrict__ node_to_comm,
     NodeID num_nodes,
-    int comp_id,
-    unsigned long long* edge_count,
-    unsigned long long* node_count
+    Weight* comm_degrees
 ) {
-    NodeID node = blockIdx.x * blockDim.x + threadIdx.x;
-    if (node >= num_nodes || component_id[node] != comp_id) return;
+    NodeID u = blockIdx.x * blockDim.x + threadIdx.x;
+    if (u >= num_nodes) return;
     
-    // Count this node
-    atomicAdd(node_count, 1ULL);
-    
-    EdgeID start = row_ptr[node];
-    EdgeID end = row_ptr[node + 1];
-    
-    for (EdgeID e = start; e < end; ++e) {
-        NodeID neighbor = col_idx[e];
-        // Count each edge once (only if neighbor > node and in same component)
-        if (component_id[neighbor] == comp_id && neighbor > node) {
-            atomicAdd(edge_count, 1ULL);
-        }
-    }
+    Community cu = node_to_comm[u];
+    Weight deg = node_degrees[u];
+    atomicAdd(&comm_degrees[cu], deg);
 }
 
-// Kernel: Compute best moves for ACTIVE nodes only
-__global__ void compute_best_moves_active_kernel(
+// Kernel: Compute best community for each node
+__global__ void compute_best_community_kernel(
     const EdgeID* __restrict__ row_ptr,
     const NodeID* __restrict__ col_idx,
     const Weight* __restrict__ weights,
     const Weight* __restrict__ node_degrees,
     const Community* __restrict__ node_to_comm,
     const Weight* __restrict__ comm_degrees,
-    const bool* __restrict__ is_active,
     NodeID num_nodes,
     Weight total_weight,
     Weight resolution,
-    Weight min_gain,
     Community* best_comm,
-    Weight* best_delta_Q,
-    bool* has_improvement
+    Weight* best_delta_Q
 ) {
-    NodeID node = blockIdx.x * blockDim.x + threadIdx.x;
-    if (node >= num_nodes || !is_active[node]) return;
+    NodeID u = blockIdx.x * blockDim.x + threadIdx.x;
+    if (u >= num_nodes) return;
     
-    Community current_comm = node_to_comm[node];
-    Weight node_deg = node_degrees[node];
+    Community cu = node_to_comm[u];
+    Weight ku = node_degrees[u];
+    Weight m2 = total_weight;
     
-    // Count weights to each neighboring community
-    EdgeID start = row_ptr[node];
-    EdgeID end = row_ptr[node + 1];
+    EdgeID start = row_ptr[u];
+    EdgeID end = row_ptr[u + 1];
     
-    // First pass: compute k_i_in for current community
-    Weight k_i_in_current = 0.0f;
+    // Compute weight to current community (excluding self-loops counted once)
+    Weight k_u_in_cu = 0.0f;
     for (EdgeID e = start; e < end; ++e) {
-        NodeID neighbor = col_idx[e];
-        if (node_to_comm[neighbor] == current_comm) {
-            k_i_in_current += weights[e];
+        NodeID v = col_idx[e];
+        if (node_to_comm[v] == cu) {
+            k_u_in_cu += weights[e];
         }
     }
     
-    Weight sigma_tot_current = comm_degrees[current_comm];
-    
-    // Find best neighboring community
-    Community best = current_comm;
+    // Try to find best neighboring community
+    Community best = cu;
     Weight best_delta = 0.0f;
     
-    // Track visited communities to avoid recomputation
-    const int MAX_NEIGHBOR_COMMS = 32;
-    Community visited_comms[MAX_NEIGHBOR_COMMS];
-    int num_visited = 0;
+    // Use a simple array to track unique neighboring communities
+    const int MAX_NEIGHBORS = 32;
+    Community neighbor_comms[MAX_NEIGHBORS];
+    Weight neighbor_weights[MAX_NEIGHBORS];
+    int num_neighbors = 0;
     
+    // Aggregate weights to each neighboring community
     for (EdgeID e = start; e < end; ++e) {
-        NodeID neighbor = col_idx[e];
-        Community neighbor_comm = node_to_comm[neighbor];
+        NodeID v = col_idx[e];
+        Community cv = node_to_comm[v];
+        Weight w = weights[e];
         
-        if (neighbor_comm == current_comm) continue;
-        
-        // Check if already evaluated this community
-        bool already_checked = false;
-        for (int i = 0; i < num_visited; ++i) {
-            if (visited_comms[i] == neighbor_comm) {
-                already_checked = true;
+        // Find or add this community
+        bool found = false;
+        for (int i = 0; i < num_neighbors; ++i) {
+            if (neighbor_comms[i] == cv) {
+                neighbor_weights[i] += w;
+                found = true;
                 break;
             }
         }
-        if (already_checked) continue;
-        
-        // Mark as visited
-        if (num_visited < MAX_NEIGHBOR_COMMS) {
-            visited_comms[num_visited++] = neighbor_comm;
-        }
-        
-        // Compute k_i_in for this community
-        Weight k_i_in_new = 0.0f;
-        for (EdgeID e2 = start; e2 < end; ++e2) {
-            if (node_to_comm[col_idx[e2]] == neighbor_comm) {
-                k_i_in_new += weights[e2];
-            }
-        }
-        
-        Weight sigma_tot_new = comm_degrees[neighbor_comm];
-        
-        // Compute modularity delta (Improved Louvain formula)
-        Weight delta_Q_in = k_i_in_new - resolution * sigma_tot_new * node_deg / total_weight;
-        Weight delta_Q_out = k_i_in_current - resolution * (sigma_tot_current - node_deg) * node_deg / total_weight;
-        Weight delta_Q = (delta_Q_in - delta_Q_out) / total_weight;
-        
-        if (delta_Q > best_delta) {
-            best_delta = delta_Q;
-            best = neighbor_comm;
+        if (!found && num_neighbors < MAX_NEIGHBORS) {
+            neighbor_comms[num_neighbors] = cv;
+            neighbor_weights[num_neighbors] = w;
+            num_neighbors++;
         }
     }
     
-    best_comm[node] = best;
-    best_delta_Q[node] = best_delta;
-    
-    if (best != current_comm && best_delta > min_gain) {
-        has_improvement[node] = true;
-    } else {
-        has_improvement[node] = false;
+    // Evaluate each neighboring community
+    for (int i = 0; i < num_neighbors; ++i) {
+        Community cv = neighbor_comms[i];
+        Weight k_u_in_cv = neighbor_weights[i];
+        
+        if (cv == cu) continue; // Skip current community
+        
+        Weight sigma_tot_cv = comm_degrees[cv];
+        Weight sigma_tot_cu = comm_degrees[cu];
+        
+        // Delta Q when moving from cu to cv
+        // Based on standard Louvain formula
+        Weight delta = (k_u_in_cv - k_u_in_cu) / m2 
+                     - resolution * ku * (sigma_tot_cv - sigma_tot_cu + ku) / (m2 * m2);
+        
+        if (delta > best_delta) {
+            best_delta = delta;
+            best = cv;
+        }
     }
+    
+    best_comm[u] = best;
+    best_delta_Q[u] = best_delta;
 }
 
-// Kernel: Apply moves and mark nodes that moved (FIXED VERSION)
+// Kernel: Apply moves (single pass)
 __global__ void apply_moves_kernel(
     const Community* __restrict__ best_comm,
-    const bool* __restrict__ has_improvement,
-    const bool* __restrict__ is_active,
+    const Weight* __restrict__ best_delta_Q,
     NodeID num_nodes,
+    Weight threshold,
     Community* node_to_comm,
-    bool* moved
+    int* changed
 ) {
-    NodeID node = blockIdx.x * blockDim.x + threadIdx.x;
-    if (node >= num_nodes || !is_active[node]) {
-        if (node < num_nodes) moved[node] = false;
-        return;
-    }
+    NodeID u = blockIdx.x * blockDim.x + threadIdx.x;
+    if (u >= num_nodes) return;
     
-    if (!has_improvement[node]) {
-        moved[node] = false;
-        return;
-    }
+    Community new_comm = best_comm[u];
+    Community old_comm = node_to_comm[u];
+    Weight delta = best_delta_Q[u];
     
-    Community old_comm = node_to_comm[node];
-    Community new_comm = best_comm[node];
-    
-    // Only apply move, don't update degrees here
-    node_to_comm[node] = new_comm;
-    moved[node] = true;
-}
-
-// Kernel: Recompute all community degrees from scratch
-__global__ void recompute_comm_degrees_kernel(
-    const Weight* __restrict__ node_degrees,
-    const Community* __restrict__ node_to_comm,
-    NodeID num_nodes,
-    Weight* comm_degrees
-) {
-    NodeID node = blockIdx.x * blockDim.x + threadIdx.x;
-    if (node >= num_nodes) return;
-    
-    Community comm = node_to_comm[node];
-    Weight deg = node_degrees[node];
-    
-    atomicAdd(&comm_degrees[comm], deg);
-}
-
-// Kernel: Mark nodes as active for next iteration (nodes that moved + their neighbors)
-__global__ void update_active_nodes_kernel(
-    const EdgeID* __restrict__ row_ptr,
-    const NodeID* __restrict__ col_idx,
-    const bool* __restrict__ moved,
-    NodeID num_nodes,
-    bool* next_active
-) {
-    NodeID node = blockIdx.x * blockDim.x + threadIdx.x;
-    if (node >= num_nodes) return;
-    
-    // If this node moved, it's active
-    if (moved[node]) {
-        next_active[node] = true;
-        
-        // Mark all neighbors as active
-        EdgeID start = row_ptr[node];
-        EdgeID end = row_ptr[node + 1];
-        for (EdgeID e = start; e < end; ++e) {
-            NodeID neighbor = col_idx[e];
-            next_active[neighbor] = true;
-        }
+    if (new_comm != old_comm && delta > threshold) {
+        node_to_comm[u] = new_comm;
+        atomicAdd(changed, 1);
     }
 }
 
@@ -301,48 +199,38 @@ __global__ void compute_modularity_kernel(
     const NodeID* __restrict__ col_idx,
     const Weight* __restrict__ weights,
     const Community* __restrict__ node_to_comm,
-    const Weight* __restrict__ node_degrees,
+    const Weight* __restrict__ comm_degrees,
     NodeID num_nodes,
     Weight total_weight,
     Weight resolution,
-    Weight* internal_edges,
-    Weight* total_degrees
+    Weight* partial_Q
 ) {
-    NodeID node = blockIdx.x * blockDim.x + threadIdx.x;
-    if (node >= num_nodes) return;
+    NodeID u = blockIdx.x * blockDim.x + threadIdx.x;
+    if (u >= num_nodes) return;
     
-    Community node_comm = node_to_comm[node];
-    Weight node_deg = node_degrees[node];
+    Community cu = node_to_comm[u];
+    EdgeID start = row_ptr[u];
+    EdgeID end = row_ptr[u + 1];
     
-    // Add to community total degree
-    atomicAdd(&total_degrees[node_comm], node_deg);
-    
-    // Count internal edges
-    EdgeID start = row_ptr[node];
-    EdgeID end = row_ptr[node + 1];
-    
+    Weight internal = 0.0f;
     for (EdgeID e = start; e < end; ++e) {
-        NodeID neighbor = col_idx[e];
-        Community neighbor_comm = node_to_comm[neighbor];
-        
-        if (node_comm == neighbor_comm && node <= neighbor) {
-            Weight w = weights[e];
-            atomicAdd(&internal_edges[node_comm], w);
+        NodeID v = col_idx[e];
+        if (node_to_comm[v] == cu && u <= v) { // Count each edge once
+            internal += weights[e];
         }
     }
+    
+    atomicAdd(partial_Q, internal);
 }
 
 class CUDAImprovedLouvain {
-public:
+private:
     DeviceGraph d_graph_;
     thrust::device_vector<Community> d_node_to_comm_;
     thrust::device_vector<Weight> d_comm_degrees_;
+    thrust::device_vector<Weight> d_comm_internal_;
     thrust::device_vector<Community> d_best_comm_;
     thrust::device_vector<Weight> d_best_delta_Q_;
-    thrust::device_vector<bool> d_has_improvement_;
-    thrust::device_vector<bool> d_moved_;
-    thrust::device_vector<bool> d_active_;
-    thrust::device_vector<bool> d_is_tree_node_;
     
     double resolution_;
     double min_modularity_gain_;
@@ -366,11 +254,6 @@ public:
         , block_size_(block_size) {
         
         upload_graph_to_device(graph);
-        
-        // Detect and split tree structures
-        uint32_t tree_nodes = detect_and_split_trees();
-        printf("Detected %u tree nodes\n", tree_nodes);
-        
         initialize_communities(graph.num_nodes());
     }
     
@@ -384,7 +267,7 @@ public:
     Result detect_communities() {
         Result result;
         
-        printf("Starting CUDA Improved Louvain algorithm...\n");
+        printf("Starting CUDA Louvain algorithm...\n");
         printf("Graph: %u nodes, %lu edges, total weight: %.2f\n",
                d_graph_.num_nodes, (unsigned long)d_graph_.num_edges, d_graph_.total_weight);
         
@@ -393,23 +276,48 @@ public:
         const uint32_t MAX_ITERATIONS = 100;
         
         while (iteration < MAX_ITERATIONS) {
-            // Count active nodes
-            uint32_t num_active = thrust::reduce(d_active_.begin(), d_active_.end(), 0u);
-            printf("\nIteration %u: Active nodes = %u\n", iteration, num_active);
+            // Update community information
+            update_community_info();
             
-            if (num_active == 0) {
-                printf("No active nodes remaining, stopping\n");
+            // Compute best moves for all nodes
+            int num_blocks = (d_graph_.num_nodes + block_size_ - 1) / block_size_;
+            
+            compute_best_community_kernel<<<num_blocks, block_size_>>>(
+                d_graph_.d_row_ptr,
+                d_graph_.d_col_idx,
+                d_graph_.d_weights,
+                d_graph_.d_node_degrees,
+                thrust::raw_pointer_cast(d_node_to_comm_.data()),
+                thrust::raw_pointer_cast(d_comm_degrees_.data()),
+                d_graph_.num_nodes,
+                d_graph_.total_weight,
+                resolution_,
+                thrust::raw_pointer_cast(d_best_comm_.data()),
+                thrust::raw_pointer_cast(d_best_delta_Q_.data())
+            );
+            CUDA_CHECK(cudaDeviceSynchronize());
+            
+            // Apply moves
+            thrust::device_vector<int> d_changed(1, 0);
+            apply_moves_kernel<<<num_blocks, block_size_>>>(
+                thrust::raw_pointer_cast(d_best_comm_.data()),
+                thrust::raw_pointer_cast(d_best_delta_Q_.data()),
+                d_graph_.num_nodes,
+                min_modularity_gain_,
+                thrust::raw_pointer_cast(d_node_to_comm_.data()),
+                thrust::raw_pointer_cast(d_changed.data())
+            );
+            CUDA_CHECK(cudaDeviceSynchronize());
+            
+            int num_changed = d_changed[0];
+            printf("Iteration %u: %d nodes changed community\n", iteration, num_changed);
+            
+            if (num_changed == 0) {
+                printf("No changes, converged.\n");
                 break;
             }
             
-            // Phase 1: Dynamic iteration on active nodes only
-            bool improvement = phase1_dynamic_iteration();
-            
-            if (!improvement) {
-                printf("Iteration %u: No improvement, stopping\n", iteration);
-                break;
-            }
-            
+            // Compute current modularity
             double current_modularity = compute_modularity();
             uint32_t num_comms = count_communities();
             
@@ -418,17 +326,11 @@ public:
             
             if (iteration > 0) {
                 double mod_gain = current_modularity - prev_modularity;
-                printf("  Modularity gain: %.6e (threshold: %.6e)\n", 
-                       mod_gain, min_modularity_gain_);
+                printf("  Modularity gain: %.6e\n", mod_gain);
                 
                 if (mod_gain < min_modularity_gain_) {
-                    printf("Iteration %u: Modularity gain < threshold, stopping\n", iteration);
+                    printf("Modularity gain below threshold, stopping\n");
                     break;
-                }
-                
-                // Safety check: if modularity decreased, something is wrong
-                if (mod_gain < -1e-6) {
-                    printf("Warning: Modularity decreased! This shouldn't happen.\n");
                 }
             }
             
@@ -436,31 +338,25 @@ public:
             iteration++;
         }
         
-        if (iteration >= MAX_ITERATIONS) {
-            printf("Warning: Reached maximum iterations (%u)\n", MAX_ITERATIONS);
-        }
-        
         printf("\nFinal results:\n");
-        printf("  Total iterations: %u\n", iteration);
         
         // Download results
         thrust::host_vector<Community> h_communities = d_node_to_comm_;
-        thrust::host_vector<bool> h_tree_nodes = d_is_tree_node_;
         
         result.communities.assign(h_communities.begin(), h_communities.end());
         result.modularity = compute_modularity();
         result.num_communities = count_communities();
         result.num_iterations = iteration;
-        result.tree_nodes_detected = thrust::reduce(h_tree_nodes.begin(), h_tree_nodes.end(), 0u);
+        result.tree_nodes_detected = 0;
         
         printf("  Final modularity: %.6f\n", result.modularity);
         printf("  Final communities: %u\n", result.num_communities);
-        printf("  Tree nodes: %u\n", result.tree_nodes_detected);
+        printf("  Total iterations: %u\n", result.num_iterations);
         
         return result;
     }
     
-    // Public helper functions (needed for device lambdas)
+private:
     void upload_graph_to_device(const Graph& graph) {
         d_graph_.num_nodes = graph.num_nodes();
         d_graph_.num_edges = graph.num_edges();
@@ -487,317 +383,93 @@ public:
         h_row_ptr[graph.num_nodes()] = offset;
         
         // Allocate and copy to device
-        size_t row_ptr_size = h_row_ptr.size() * sizeof(EdgeID);
-        size_t col_idx_size = h_col_idx.size() * sizeof(NodeID);
-        size_t weights_size = h_weights.size() * sizeof(Weight);
-        size_t degrees_size = h_degrees.size() * sizeof(Weight);
-        
-        CUDA_CHECK(cudaMalloc(&d_graph_.d_row_ptr, row_ptr_size));
-        CUDA_CHECK(cudaMalloc(&d_graph_.d_col_idx, col_idx_size));
-        CUDA_CHECK(cudaMalloc(&d_graph_.d_weights, weights_size));
-        CUDA_CHECK(cudaMalloc(&d_graph_.d_node_degrees, degrees_size));
+        CUDA_CHECK(cudaMalloc(&d_graph_.d_row_ptr, h_row_ptr.size() * sizeof(EdgeID)));
+        CUDA_CHECK(cudaMalloc(&d_graph_.d_col_idx, h_col_idx.size() * sizeof(NodeID)));
+        CUDA_CHECK(cudaMalloc(&d_graph_.d_weights, h_weights.size() * sizeof(Weight)));
+        CUDA_CHECK(cudaMalloc(&d_graph_.d_node_degrees, h_degrees.size() * sizeof(Weight)));
         
         CUDA_CHECK(cudaMemcpy(d_graph_.d_row_ptr, h_row_ptr.data(), 
-                             row_ptr_size, cudaMemcpyHostToDevice));
+                             h_row_ptr.size() * sizeof(EdgeID), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_graph_.d_col_idx, h_col_idx.data(),
-                             col_idx_size, cudaMemcpyHostToDevice));
+                             h_col_idx.size() * sizeof(NodeID), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_graph_.d_weights, h_weights.data(),
-                             weights_size, cudaMemcpyHostToDevice));
+                             h_weights.size() * sizeof(Weight), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_graph_.d_node_degrees, h_degrees.data(),
-                             degrees_size, cudaMemcpyHostToDevice));
-    }
-    
-    uint32_t detect_and_split_trees() {
-        NodeID num_nodes = d_graph_.num_nodes;
-        int num_blocks = (num_nodes + block_size_ - 1) / block_size_;
-        
-        d_is_tree_node_.resize(num_nodes, false);
-        
-        thrust::device_vector<int> d_component_id(num_nodes, -1);
-        thrust::device_vector<int> d_visited(num_nodes, 0);
-        thrust::device_vector<NodeID> d_parent(num_nodes, num_nodes);
-        thrust::device_vector<int> d_current_frontier(num_nodes, 0);
-        thrust::device_vector<int> d_next_frontier(num_nodes, 0);
-        
-        int comp_id = 0;
-        
-        // Find connected components and check if they're trees
-        for (NodeID start = 0; start < num_nodes; ++start) {
-            int visited = 0;
-            cudaMemcpy(&visited, thrust::raw_pointer_cast(d_visited.data()) + start,
-                      sizeof(int), cudaMemcpyDeviceToHost);
-            
-            if (visited) continue;
-            
-            // Initialize BFS from this node
-            thrust::fill(d_current_frontier.begin(), d_current_frontier.end(), 0);
-            thrust::fill(d_next_frontier.begin(), d_next_frontier.end(), 0);
-            d_current_frontier[start] = 1;
-            d_visited[start] = 1;
-            d_component_id[start] = comp_id;
-            
-            uint32_t component_size = 1;
-            
-            // BFS to find component
-            bool has_frontier = true;
-            while (has_frontier) {
-                bfs_step_kernel<<<num_blocks, block_size_>>>(
-                    d_graph_.d_row_ptr,
-                    d_graph_.d_col_idx,
-                    num_nodes,
-                    thrust::raw_pointer_cast(d_current_frontier.data()),
-                    thrust::raw_pointer_cast(d_next_frontier.data()),
-                    thrust::raw_pointer_cast(d_visited.data()),
-                    thrust::raw_pointer_cast(d_parent.data()),
-                    thrust::raw_pointer_cast(d_component_id.data()),
-                    comp_id
-                );
-                CUDA_CHECK(cudaDeviceSynchronize());
-                
-                uint32_t frontier_size = thrust::reduce(d_next_frontier.begin(),
-                                                        d_next_frontier.end(), 0);
-                component_size += frontier_size;
-                
-                if (frontier_size == 0) {
-                    has_frontier = false;
-                } else {
-                    d_current_frontier = d_next_frontier;
-                    thrust::fill(d_next_frontier.begin(), d_next_frontier.end(), 0);
-                }
-            }
-            
-            // Count edges in component
-            thrust::device_vector<unsigned long long> d_edge_count(1, 0ULL);
-            thrust::device_vector<unsigned long long> d_node_count(1, 0ULL);
-            count_component_edges_kernel<<<num_blocks, block_size_>>>(
-                d_graph_.d_row_ptr,
-                d_graph_.d_col_idx,
-                thrust::raw_pointer_cast(d_component_id.data()),
-                num_nodes,
-                comp_id,
-                thrust::raw_pointer_cast(d_edge_count.data()),
-                thrust::raw_pointer_cast(d_node_count.data())
-            );
-            CUDA_CHECK(cudaDeviceSynchronize());
-            
-            unsigned long long edge_count;
-            unsigned long long node_count_verify;
-            CUDA_CHECK(cudaMemcpy(&edge_count, 
-                thrust::raw_pointer_cast(d_edge_count.data()),
-                sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(&node_count_verify, 
-                thrust::raw_pointer_cast(d_node_count.data()),
-                sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-            
-            // Check if it's a tree: |E| = |V| - 1 and size > 2
-            if (node_count_verify > 2 && edge_count == node_count_verify - 1) {
-                printf("Component %d: Tree detected! nodes=%llu, edges=%llu\n", 
-                       comp_id, node_count_verify, edge_count);
-                // Mark all nodes in this component as tree nodes
-                mark_tree_component(d_component_id, comp_id, num_nodes);
-            }
-            
-            comp_id++;
-        }
-        
-        return thrust::reduce(d_is_tree_node_.begin(), d_is_tree_node_.end(), 0u);
+                             h_degrees.size() * sizeof(Weight), cudaMemcpyHostToDevice));
     }
     
     void initialize_communities(NodeID num_nodes) {
         d_node_to_comm_.resize(num_nodes);
         d_comm_degrees_.resize(num_nodes);
+        d_comm_internal_.resize(num_nodes);
         d_best_comm_.resize(num_nodes);
         d_best_delta_Q_.resize(num_nodes);
-        d_has_improvement_.resize(num_nodes);
-        d_moved_.resize(num_nodes);
-        d_active_.resize(num_nodes);
         
         // Initialize each node to its own community
         thrust::sequence(d_node_to_comm_.begin(), d_node_to_comm_.end());
-        
-        // Copy node degrees to community degrees
-        CUDA_CHECK(cudaMemcpy(thrust::raw_pointer_cast(d_comm_degrees_.data()),
-                             d_graph_.d_node_degrees,
-                             num_nodes * sizeof(Weight),
-                             cudaMemcpyDeviceToDevice));
-        
-        // Mark non-tree nodes as active initially
-        thrust::transform(
-            d_is_tree_node_.begin(),
-            d_is_tree_node_.end(),
-            d_active_.begin(),
-            thrust::logical_not<bool>()
-        );
     }
     
-    bool phase1_dynamic_iteration() {
+    void update_community_info() {
         NodeID num_nodes = d_graph_.num_nodes;
         int num_blocks = (num_nodes + block_size_ - 1) / block_size_;
         
-        bool global_improvement = false;
-        const int MAX_INNER_ITERATIONS = 100; // Prevent infinite loops
-        int inner_iteration = 0;
+        // Reset community info
+        thrust::fill(d_comm_degrees_.begin(), d_comm_degrees_.end(), 0.0f);
+        thrust::fill(d_comm_internal_.begin(), d_comm_internal_.end(), 0.0f);
         
-        // Dynamic iteration: continue while there are active nodes
-        while (inner_iteration < MAX_INNER_ITERATIONS) {
-            uint32_t num_active = thrust::reduce(d_active_.begin(), d_active_.end(), 0u);
-            
-            if (num_active == 0) {
-                printf("  Inner iteration %d: No active nodes, stopping\n", inner_iteration);
-                break;
-            }
-            
-            // Reset flags
-            thrust::fill(d_has_improvement_.begin(), d_has_improvement_.end(), false);
-            thrust::fill(d_moved_.begin(), d_moved_.end(), false);
-            
-            // Compute best moves for active nodes only
-            compute_best_moves_active_kernel<<<num_blocks, block_size_>>>(
-                d_graph_.d_row_ptr,
-                d_graph_.d_col_idx,
-                d_graph_.d_weights,
-                d_graph_.d_node_degrees,
-                thrust::raw_pointer_cast(d_node_to_comm_.data()),
-                thrust::raw_pointer_cast(d_comm_degrees_.data()),
-                thrust::raw_pointer_cast(d_active_.data()),
-                num_nodes,
-                d_graph_.total_weight,
-                resolution_,
-                min_modularity_gain_,
-                thrust::raw_pointer_cast(d_best_comm_.data()),
-                thrust::raw_pointer_cast(d_best_delta_Q_.data()),
-                thrust::raw_pointer_cast(d_has_improvement_.data())
-            );
-            CUDA_CHECK(cudaDeviceSynchronize());
-            
-            // Check if any improvements found
-            bool any_improvement = thrust::reduce(d_has_improvement_.begin(),
-                                                 d_has_improvement_.end(),
-                                                 false,
-                                                 thrust::logical_or<bool>());
-            
-            if (!any_improvement) {
-                printf("  Inner iteration %d: No improvements, stopping\n", inner_iteration);
-                break;
-            }
-            
-            global_improvement = true;
-            
-            // Apply moves
-            apply_moves_kernel<<<num_blocks, block_size_>>>(
-                thrust::raw_pointer_cast(d_best_comm_.data()),
-                thrust::raw_pointer_cast(d_has_improvement_.data()),
-                thrust::raw_pointer_cast(d_active_.data()),
-                num_nodes,
-                thrust::raw_pointer_cast(d_node_to_comm_.data()),
-                thrust::raw_pointer_cast(d_moved_.data())
-            );
-            CUDA_CHECK(cudaDeviceSynchronize());
-            
-            // Recompute community degrees from scratch to avoid race conditions
-            thrust::fill(d_comm_degrees_.begin(), d_comm_degrees_.end(), 0.0f);
-            recompute_comm_degrees_kernel<<<num_blocks, block_size_>>>(
-                d_graph_.d_node_degrees,
-                thrust::raw_pointer_cast(d_node_to_comm_.data()),
-                num_nodes,
-                thrust::raw_pointer_cast(d_comm_degrees_.data())
-            );
-            CUDA_CHECK(cudaDeviceSynchronize());
-            
-            // Count how many nodes actually moved
-            uint32_t num_moved = thrust::reduce(d_moved_.begin(), d_moved_.end(), 0u);
-            printf("  Inner iteration %d: %u nodes moved\n", inner_iteration, num_moved);
-            
-            if (num_moved == 0) {
-                printf("  Inner iteration %d: No nodes moved, stopping\n", inner_iteration);
-                break;
-            }
-            
-            // Update active set: nodes that moved + their neighbors
-            thrust::fill(d_active_.begin(), d_active_.end(), false);
-            
-            update_active_nodes_kernel<<<num_blocks, block_size_>>>(
-                d_graph_.d_row_ptr,
-                d_graph_.d_col_idx,
-                thrust::raw_pointer_cast(d_moved_.data()),
-                num_nodes,
-                thrust::raw_pointer_cast(d_active_.data())
-            );
-            CUDA_CHECK(cudaDeviceSynchronize());
-            
-            // Exclude tree nodes from active set
-            exclude_tree_nodes_from_active();
-            
-            inner_iteration++;
-        }
-        
-        if (inner_iteration >= MAX_INNER_ITERATIONS) {
-            printf("  Warning: Reached maximum inner iterations (%d)\n", MAX_INNER_ITERATIONS);
-        }
-        
-        return global_improvement;
-    }
-    
-    void mark_tree_component(thrust::device_vector<int>& d_component_id, int comp_id, NodeID num_nodes) {
-        thrust::transform(
-            thrust::make_counting_iterator<NodeID>(0),
-            thrust::make_counting_iterator<NodeID>(num_nodes),
-            d_component_id.begin(),
-            d_is_tree_node_.begin(),
-            [comp_id] __device__ (NodeID node, int cid) {
-                return cid == comp_id;
-            }
+        // Compute community degrees
+        compute_community_degrees_kernel<<<num_blocks, block_size_>>>(
+            d_graph_.d_node_degrees,
+            thrust::raw_pointer_cast(d_node_to_comm_.data()),
+            num_nodes,
+            thrust::raw_pointer_cast(d_comm_degrees_.data())
         );
-    }
-    
-    void exclude_tree_nodes_from_active() {
-        thrust::transform(
-            d_active_.begin(),
-            d_active_.end(),
-            d_is_tree_node_.begin(),
-            d_active_.begin(),
-            [] __device__ (bool active, bool is_tree) {
-                return active && !is_tree;
-            }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        
+        // Compute community internal weights
+        initialize_community_weights_kernel<<<num_blocks, block_size_>>>(
+            d_graph_.d_row_ptr,
+            d_graph_.d_col_idx,
+            d_graph_.d_weights,
+            thrust::raw_pointer_cast(d_node_to_comm_.data()),
+            num_nodes,
+            thrust::raw_pointer_cast(d_comm_internal_.data())
         );
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
     
     double compute_modularity() {
         NodeID num_nodes = d_graph_.num_nodes;
         int num_blocks = (num_nodes + block_size_ - 1) / block_size_;
         
-        thrust::device_vector<Weight> d_internal_edges(num_nodes, 0.0f);
-        thrust::device_vector<Weight> d_total_degrees(num_nodes, 0.0f);
+        thrust::device_vector<Weight> d_partial_Q(1, 0.0f);
         
         compute_modularity_kernel<<<num_blocks, block_size_>>>(
             d_graph_.d_row_ptr,
             d_graph_.d_col_idx,
             d_graph_.d_weights,
             thrust::raw_pointer_cast(d_node_to_comm_.data()),
-            d_graph_.d_node_degrees,
+            thrust::raw_pointer_cast(d_comm_degrees_.data()),
             num_nodes,
             d_graph_.total_weight,
             resolution_,
-            thrust::raw_pointer_cast(d_internal_edges.data()),
-            thrust::raw_pointer_cast(d_total_degrees.data())
+            thrust::raw_pointer_cast(d_partial_Q.data())
         );
         CUDA_CHECK(cudaDeviceSynchronize());
         
-        // Compute modularity on host
-        thrust::host_vector<Weight> h_internal = d_internal_edges;
-        thrust::host_vector<Weight> h_degrees = d_total_degrees;
+        Weight sum_in = d_partial_Q[0];
         
-        double Q = 0.0;
-        for (size_t i = 0; i < h_internal.size(); ++i) {
-            if (h_degrees[i] > 0) {
-                double l_c = h_internal[i];
-                double d_c = h_degrees[i];
-                Q += l_c / d_graph_.total_weight - 
-                     resolution_ * (d_c / (2.0 * d_graph_.total_weight)) * 
-                                  (d_c / (2.0 * d_graph_.total_weight));
+        // Compute sum of (degree_c / (2*m))^2 for all communities
+        thrust::host_vector<Weight> h_comm_degrees = d_comm_degrees_;
+        double sum_tot = 0.0;
+        for (size_t c = 0; c < h_comm_degrees.size(); ++c) {
+            if (h_comm_degrees[c] > 0) {
+                double deg_c = h_comm_degrees[c];
+                sum_tot += (deg_c / d_graph_.total_weight) * (deg_c / d_graph_.total_weight);
             }
         }
         
+        double Q = sum_in / d_graph_.total_weight - resolution_ * sum_tot;
         return Q;
     }
     
