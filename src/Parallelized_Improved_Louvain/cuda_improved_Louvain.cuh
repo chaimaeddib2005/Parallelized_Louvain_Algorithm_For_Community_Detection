@@ -377,8 +377,8 @@ public:
         Result result;
         
         printf("Starting CUDA Improved Louvain algorithm...\n");
-        printf("Graph: %u nodes, %llu edges, total weight: %.2f\n",
-               d_graph_.num_nodes, d_graph_.num_edges, d_graph_.total_weight);
+        printf("Graph: %u nodes, %lu edges, total weight: %.2f\n",
+               d_graph_.num_nodes, (unsigned long)d_graph_.num_edges, d_graph_.total_weight);
         
         uint32_t iteration = 0;
         double prev_modularity = -1.0;
